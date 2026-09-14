@@ -1,9 +1,15 @@
 /**
  * Core Fetch API Client for BiteBuddy Frontend.
- * Reads base URL from NEXT_PUBLIC_API_URL and passes `credentials: 'include'` for HTTP-Only JWT cookies.
+ * Reads base URL from NEXT_PUBLIC_API_URL or defaults to Render backend deployment.
+ * Supports cross-origin HTTP-Only JWT authentication cookies via `credentials: 'include'`.
  */
 
-const API_BASE_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:5000/api';
+const rawBase = (process.env.NEXT_PUBLIC_API_URL || 'https://bitebuddybackend-uhno.onrender.com')
+  .trim()
+  .replace(/\/+$/, '');
+
+// Ensure base URL always points to /api without duplicating if the env var already includes /api
+export const API_BASE_URL = rawBase.endsWith('/api') ? rawBase : `${rawBase}/api`;
 
 export class ApiError extends Error {
   status: number;
@@ -17,8 +23,21 @@ export class ApiError extends Error {
   }
 }
 
+/**
+ * Resolves an endpoint to a full URL, safely handling leading slashes and preventing duplicate /api
+ */
+export function buildApiUrl(endpoint: string): string {
+  const cleanEndpoint = endpoint.startsWith('/') ? endpoint : `/${endpoint}`;
+  if (cleanEndpoint.startsWith('/api/')) {
+    // If endpoint already starts with /api/, attach to raw root base domain
+    const rootDomain = rawBase.endsWith('/api') ? rawBase.slice(0, -4) : rawBase;
+    return `${rootDomain}${cleanEndpoint}`;
+  }
+  return `${API_BASE_URL}${cleanEndpoint}`;
+}
+
 export async function request<T>(endpoint: string, options: RequestInit = {}): Promise<T> {
-  const url = `${API_BASE_URL}${endpoint}`;
+  const url = buildApiUrl(endpoint);
 
   const headers = new Headers(options.headers);
   if (options.body && !(options.body instanceof FormData)) {
@@ -28,7 +47,7 @@ export async function request<T>(endpoint: string, options: RequestInit = {}): P
   const config: RequestInit = {
     ...options,
     headers,
-    credentials: 'include', // MANDATORY FOR HTTP-ONLY JWT COOKIES
+    credentials: 'include', // Cross-origin HTTP-Only cookie support
   };
 
   try {
@@ -43,9 +62,10 @@ export async function request<T>(endpoint: string, options: RequestInit = {}): P
     }
 
     if (!response.ok) {
-      const errorMessage = (typeof data === 'object' && data?.message)
-        ? data.message
-        : `Request failed with status ${response.status}`;
+      const errorMessage =
+        typeof data === 'object' && data?.message
+          ? data.message
+          : `Request failed with status ${response.status}`;
       throw new ApiError(errorMessage, response.status, data);
     }
 
@@ -55,7 +75,7 @@ export async function request<T>(endpoint: string, options: RequestInit = {}): P
       throw error;
     }
     throw new ApiError(
-      (error as Error).message || 'Unable to connect to BiteBuddy server. Please verify backend is running on http://localhost:5000.',
+      (error as Error).message || `Unable to connect to BiteBuddy backend at ${API_BASE_URL}`,
       0
     );
   }
