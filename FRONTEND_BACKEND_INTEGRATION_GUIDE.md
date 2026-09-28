@@ -58,33 +58,48 @@ const API_BASE_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:5000/a
 
 ---
 
-## 3. Authentication Flow
+## 3. Dual-Token Authentication Flow (RTR + In-Memory Access Token)
 
-### Why HTTP-Only Cookies over `localStorage`?
-Storing JWT tokens in `localStorage` leaves your app vulnerable to **Cross-Site Scripting (XSS)**. If a malicious third-party script runs in the browser, it can read `localStorage.getItem('token')` and hijack user accounts.
-
-**HTTP-Only Cookies Solution**:
-1. Upon login (`POST /api/auth/login`), Express sends a cookie header:
-   `Set-Cookie: token=eyJhbGci...; HttpOnly; Path=/; SameSite=Lax; Max-Age=604800`
-2. The `HttpOnly` flag hides the cookie from JavaScript (`document.cookie` cannot read it).
-3. The browser automatically attaches the cookie to every request sent to `http://localhost:5000/api` when `credentials: 'include'` is set on `fetch()`!
+### Why Dual-Token Architecture?
+- **Short-Lived Access Token (15 min)**: Kept strictly in JavaScript memory (`lib/api/client.ts`). Even if an XSS vulnerability occurs, the token is not stored in `localStorage` or `sessionStorage`.
+- **Long-Lived Refresh Token (30 days)**: Stored in a hardened `HttpOnly`, `Secure`, `SameSite=Lax` cookie. JavaScript cannot read or alter it.
+- **Refresh Token Rotation (RTR)**: Every time the access token is refreshed via `POST /api/auth/refresh`, the server invalidates the previous refresh token and issues a brand-new token pair.
 
 ```
-+------------------+                    +---------------------+
-|  Browser / React |                    | Express.js Backend  |
-+------------------+                    +---------------------+
-         |                                         |
-         |  1. POST /api/auth/login                |
-         |---------------------------------------->|
-         |                                         | 2. Validates & creates JWT
-         |  3. 200 OK + Set-Cookie (HttpOnly)      |
-         |<----------------------------------------|
-         |                                         |
-         |  4. GET /api/auth/me (Cookie sent auto) |
-         |---------------------------------------->|
-         |                                         | 5. Verifies JWT cookie
-         |  6. Returns User Profile JSON           |
-         |<----------------------------------------|
++---------------------------------------+                    +------------------------------------+
+|            Next.js Frontend           |                    |         Express.js Backend         |
++---------------------------------------+                    +------------------------------------+
+                   |                                                          |
+                   |  1. POST /api/auth/login                                 |
+                   |--------------------------------------------------------->|
+                   |                                                          | 2. Validates credentials
+                   |  3. 200 OK: { accessToken } + Set-Cookie: refreshToken  |
+                   |<---------------------------------------------------------|
+  (Saves accessToken in memory)                                               |
+                   |                                                          |
+                   |  4. Request + Header: 'Authorization: Bearer <token>'     |
+                   |--------------------------------------------------------->|
+                   |                                                          | 5. Verifies JWT Access Token
+                   |  6. 200 OK: Protected Data                               |
+                   |<---------------------------------------------------------|
+                   |                                                          |
+         [ Access Token expires after 15m ]                                   |
+                   |                                                          |
+                   |  7. Request sent with expired token                      |
+                   |--------------------------------------------------------->|
+                   |  8. 401 Unauthorized                                     |
+                   |<---------------------------------------------------------|
+                   |                                                          |
+                   |  9. POST /api/auth/refresh (HttpOnly cookie sent auto)   |
+                   |--------------------------------------------------------->|
+                   |                                                          | 10. Validates & Rotates Token
+                   | 11. 200 OK: { accessToken } + Set-Cookie: new refreshToken
+                   |<---------------------------------------------------------|
+                   |                                                          |
+                   | 12. Retries original request with new Access Token       |
+                   |--------------------------------------------------------->|
+                   | 13. 200 OK: Success!                                     |
+                   |<---------------------------------------------------------|
 ```
 
 ---
@@ -94,18 +109,19 @@ Storing JWT tokens in `localStorage` leaves your app vulnerable to **Cross-Site 
 React components re-render automatically when their internal **State** (`useState`) changes.
 
 ### `AuthContext` Architecture (`context/AuthContext.tsx`)
-Instead of manually passing user information down through every page component ("prop drilling"), `AuthContext` maintains global user state:
+Instead of manually passing user information down through every page component ("prop drilling"), `AuthContext` maintains global user state and orchestrates silent refreshes:
 
 ```tsx
 export function AuthProvider({ children }: { children: React.ReactNode }) {
   const [user, setUser] = useState<User | null>(null);
   const [loading, setLoading] = useState(true);
 
-  // Auto-restore session when browser opens
+  // Auto-restore session silently using HttpOnly refresh cookie on mount
   const refreshUser = useCallback(async () => {
     try {
+      await api.auth.refresh();
       const res = await api.auth.me();
-      setUser(res.user);
+      setUser(res.data);
     } catch (err) {
       setUser(null);
     } finally {
@@ -115,6 +131,10 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
 
   useEffect(() => {
     refreshUser();
+
+    // Auto-logout on session expiration
+    const unsubscribe = onAuthFailure(() => setUser(null));
+    return () => unsubscribe();
   }, [refreshUser]);
 
   return (

@@ -1,7 +1,7 @@
 "use client";
 
 import React, { createContext, useContext, useState, useEffect, useCallback } from 'react';
-import { api, User } from '@/lib/api';
+import { api, User, onAuthFailure } from '@/lib/api';
 
 interface AuthContextType {
   user: User | null;
@@ -34,9 +34,12 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   const [user, setUser] = useState<User | null>(null);
   const [loading, setLoading] = useState<boolean>(true);
 
+  // Silent refresh & fetch profile on boot or re-check
   const refreshUser = useCallback(async () => {
     try {
-      // Backend /auth/me returns { success, data: User }  (NOT { user: User })
+      // 1. Silent token refresh using HttpOnly cookie to get fresh Access Token
+      await api.auth.refresh();
+      // 2. Fetch authenticated user profile with valid access token
       const res = await api.auth.me();
       setUser(normalizeUser(res.data));
     } catch {
@@ -48,12 +51,20 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
 
   useEffect(() => {
     refreshUser();
+
+    // Listen for automatic token expiration / refresh failures from API client
+    const unsubscribe = onAuthFailure(() => {
+      setUser(null);
+    });
+
+    return () => {
+      unsubscribe();
+    };
   }, [refreshUser]);
 
   const login = async (credentials: { email: string; password: string }) => {
     setLoading(true);
     try {
-      // Backend /auth/login returns { success, message, user: User }
       const res = await api.auth.login(credentials);
       setUser(normalizeUser(res.user));
     } finally {
@@ -70,7 +81,6 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   }) => {
     setLoading(true);
     try {
-      // Backend /auth/register returns { success, user: User }
       const res = await api.auth.register(payload);
       setUser(normalizeUser(res.user));
     } finally {
@@ -102,3 +112,4 @@ export function useAuth() {
   }
   return context;
 }
+
